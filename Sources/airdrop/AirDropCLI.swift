@@ -11,11 +11,19 @@ import Cocoa
 
 enum OptionType: String {
     case help = "h"
+    case recipient = "r"
+    case listAliases = "list-aliases"
+    case addAlias = "add-alias"
+    case removeAlias = "remove-alias"
     case unknown
 
     init(value: String) {
         switch value {
         case "-h", "--help": self = .help
+        case "-r", "--recipient": self = .recipient
+        case "--list-aliases": self = .listAliases
+        case "--add-alias": self = .addAlias
+        case "--remove-alias": self = .removeAlias
         default: self = .unknown
         }
     }
@@ -23,46 +31,110 @@ enum OptionType: String {
 
 class AirDropCLI:  NSObject, NSApplicationDelegate, NSSharingServiceDelegate {
     let consoleIO = ConsoleIO()
+    let aliasManager = AliasManager()
     private var isIndividualSharing = false
     private var individualSharingItems: [URL] = []
     private var individualSharingSuccessful = 0
     private var individualSharingFailed = 0
     private var sharingStartTime: Date?
+    private var recipientAlias: String?
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         let argCount = Int(CommandLine.argc)
 
-        if argCount >= 2 {
-            let argument = CommandLine.arguments[1]
-            if argCount == 2 && argument.hasPrefix("-") {
-                if argument == "-" {
-                    // Process stdin
-                    let stdinPaths = readPathsFromStdin()
-                    if stdinPaths.isEmpty {
-                        consoleIO.printUsage()
-                        exit(0)
-                    }
-                    shareFiles(stdinPaths)
-                } else {
-                    let (option, _) = getOption(argument)
-
-                    if option == .help {
-                        consoleIO.printUsage()
-                    } else {
-                        consoleIO.writeMessage("Unknown option, see usage.\n", to: .error)
-                        consoleIO.printUsage()
-                    }
-
-                    exit(0)
-                }
-            } else {
-                let pathsToFiles = Array(CommandLine.arguments[1 ..< argCount])
-                shareFiles(pathsToFiles)
-            }
-        } else {
+        if argCount < 2 {
             consoleIO.printUsage()
             exit(0)
         }
+
+        var args = Array(CommandLine.arguments[1..<argCount])
+        
+        // Handle alias management commands first
+        if let firstArg = args.first {
+            let (option, _) = getOption(firstArg)
+            
+            switch option {
+            case .help:
+                consoleIO.printUsage()
+                exit(0)
+            case .listAliases:
+                listAliases()
+                exit(0)
+            case .addAlias:
+                if args.count < 2 {
+                    consoleIO.writeMessage("Usage: airdrop --add-alias <name> [description]", to: .error)
+                    exit(1)
+                }
+                let name = args[1]
+                let description = args.count > 2 ? args[2..<args.count].joined(separator: " ") : nil
+                addAlias(name: name, description: description)
+                exit(0)
+            case .removeAlias:
+                if args.count < 2 {
+                    consoleIO.writeMessage("Usage: airdrop --remove-alias <name>", to: .error)
+                    exit(1)
+                }
+                removeAlias(name: args[1])
+                exit(0)
+            default:
+                break
+            }
+        }
+        
+        // Check for recipient flag
+        var filePaths: [String] = []
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            let (option, _) = getOption(arg)
+            
+            if option == .recipient {
+                if i + 1 < args.count {
+                    recipientAlias = args[i + 1]
+                    i += 2
+                } else {
+                    consoleIO.writeMessage("Option --recipient requires a recipient name", to: .error)
+                    exit(1)
+                }
+            } else if arg == "-" {
+                // Process stdin
+                let stdinPaths = readPathsFromStdin()
+                if stdinPaths.isEmpty {
+                    consoleIO.printUsage()
+                    exit(0)
+                }
+                filePaths.append(contentsOf: stdinPaths)
+                i += 1
+            } else if arg.hasPrefix("-") {
+                consoleIO.writeMessage("Unknown option '\(arg)', see usage.\n", to: .error)
+                consoleIO.printUsage()
+                exit(1)
+            } else {
+                filePaths.append(arg)
+                i += 1
+            }
+        }
+        
+        // If we have a recipient alias, validate it exists
+        if let recipient = recipientAlias {
+            do {
+                if let alias = try aliasManager.getAlias(name: recipient) {
+                    consoleIO.writeMessage("📝 Recipient: \(alias.name)\(alias.description.map { " (\($0))" } ?? "")")
+                } else {
+                    consoleIO.writeMessage("Warning: Recipient alias '\(recipient)' not found. You can add it with: airdrop --add-alias \(recipient)")
+                }
+            } catch {
+                consoleIO.writeMessage("Error checking alias: \(error.localizedDescription)", to: .error)
+            }
+        }
+        
+        // If no file paths provided, show usage
+        if filePaths.isEmpty {
+            consoleIO.printUsage()
+            exit(0)
+        }
+        
+        shareFiles(filePaths)
 
         if #available(macOS 13.0, *) {
             NSApp.setActivationPolicy(.accessory)
@@ -221,5 +293,52 @@ class AirDropCLI:  NSObject, NSApplicationDelegate, NSSharingServiceDelegate {
         }
         
         return paths
+    }
+    
+    private func listAliases() {
+        do {
+            let aliases = try aliasManager.listAliases()
+            if aliases.isEmpty {
+                consoleIO.writeMessage("No aliases configured.")
+                consoleIO.writeMessage("\nTo add an alias, use:")
+                consoleIO.writeMessage("  airdrop --add-alias <name> [description]")
+            } else {
+                consoleIO.writeMessage("Configured recipient aliases:")
+                for alias in aliases {
+                    if let description = alias.description {
+                        consoleIO.writeMessage("  • \(alias.name) - \(description)")
+                    } else {
+                        consoleIO.writeMessage("  • \(alias.name)")
+                    }
+                }
+            }
+        } catch {
+            consoleIO.writeMessage("Error loading aliases: \(error.localizedDescription)", to: .error)
+            exit(1)
+        }
+    }
+    
+    private func addAlias(name: String, description: String?) {
+        do {
+            try aliasManager.addAlias(name: name, description: description)
+            if let desc = description {
+                consoleIO.writeMessage("✅ Added alias '\(name)' - \(desc)")
+            } else {
+                consoleIO.writeMessage("✅ Added alias '\(name)'")
+            }
+        } catch {
+            consoleIO.writeMessage("Error adding alias: \(error.localizedDescription)", to: .error)
+            exit(1)
+        }
+    }
+    
+    private func removeAlias(name: String) {
+        do {
+            try aliasManager.removeAlias(name: name)
+            consoleIO.writeMessage("✅ Removed alias '\(name)'")
+        } catch {
+            consoleIO.writeMessage("Error removing alias: \(error.localizedDescription)", to: .error)
+            exit(1)
+        }
     }
 }
